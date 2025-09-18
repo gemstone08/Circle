@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Circle Accuracy</title>
+<style>
+:root { --bg:#fff; --fg:#111; --muted:#777; --line:#ddd; }
+* { box-sizing: border-box; }
+body {
+  margin:0; background:var(--bg); color:var(--fg);
+  font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+}
+header {
+  padding:14px 20px; border-bottom:1px solid var(--line);
+  display:flex; justify-content:space-between; align-items:center;
+}
+.brand { font-weight:700; letter-spacing:.5px; }
+.btn {
+  padding:10px 14px; border:1px solid var(--fg); background:var(--fg); color:var(--bg);
+  border-radius:999px; font-weight:600; cursor:pointer;
+}
+.btn:active { transform: translateY(1px); }
+main { padding:20px; display:grid; gap:20px; max-width:960px; margin:0 auto; }
+.panel { border:1px solid var(--line); border-radius:16px; padding:16px; }
+#canvasWrap { display:flex; justify-content:center; touch-action:none; }
+#draw {
+  border:1px solid var(--line); border-radius:16px;
+  background:#fff; max-width:100%; display:block;
+}
+.meta { display:flex; gap:40px; justify-content:center; align-items:baseline; }
+.scoreBox { font-size:44px; font-weight:800; letter-spacing:.5px; }
+.timeBox { font-size:20px; color:var(--muted); }
+.hint { text-align:center; color:var(--muted); font-size:15px; margin-top:12px; line-height:1.5; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">CIRCLE · ACCURACY</div>
+  <button id="resetBtn" class="btn">RESET</button>
+</header>
+
+<main>
+  <div class="panel">
+    <div id="canvasWrap"><canvas id="draw" width="640" height="640"></canvas></div>
+    <div class="hint">
+      중심에서 시작해 회색 원을 따라 한 바퀴를 완성하세요.<br>
+      <strong>출발점에 (충분히) 근접하면 종료됩니다.</strong> (그리기 시작 = 타이머 시작)
+    </div>
+  </div>
+
+  <div class="panel meta">
+    <div class="scoreBox">SCORE <span id="score">—</span> / 100</div>
+    <div class="timeBox">TIME <span id="duration">0.00</span>s</div>
+  </div>
+</main>
+
+<script>
+/* ===== 조절용 상수(완성 판정 완화) ===== */
+const COMPLETE_REV_THRESH   = 0.90;   // 최소 회전수 (기존 0.95 → 완화)
+const COMPLETE_DIST_MIN_PX  = 18;     // 최소 픽셀 거리 (기존 12 → 완화)
+const COMPLETE_DIST_SCALE   = 0.10;   // R에 대한 비율 (기존 0.06 → 완화)
+
+const canvas = document.getElementById('draw');
+const ctx = canvas.getContext('2d');
+const resetBtn = document.getElementById('resetBtn');
+const scoreSpan = document.getElementById('score');
+const durationSpan = document.getElementById('duration');
+
+const TARGET_R   = {{ target_r }};
+let cx, cy, drawing=false, started=false, finished=false;
+let points=[], t0=null, startPt=null, lastAngle=null, cumulativeAngle=0;
+
+function layout(){
+  const size = Math.min(window.innerWidth*0.9, window.innerHeight*0.72, 720);
+  canvas.width = Math.max(320, Math.floor(size));
+  canvas.height = canvas.width;
+  cx = Math.floor(canvas.width/2);
+  cy = Math.floor(canvas.height/2);
+  drawStatic();
+}
+function drawStatic(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  // 중심점 (검정, 1개)
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI*2); ctx.fill();
+  // 목표 원 (회색, 점선)
+  ctx.strokeStyle = '#b5b5b5'; ctx.lineWidth = 2; ctx.setLineDash([6,4]);
+  ctx.beginPath(); ctx.arc(cx, cy, TARGET_R, 0, Math.PI*2); ctx.stroke();
+  ctx.setLineDash([]);
+}
+function resetAll(){
+  drawing=false; started=false; finished=false;
+  points=[]; t0=null; startPt=null; lastAngle=null; cumulativeAngle=0;
+  scoreSpan.textContent='—'; durationSpan.textContent='0.00';
+  drawStatic();
+}
+function pointerPos(e){
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX ?? (e.touches && e.touches[0].clientX)) - r.left;
+  const y = (e.clientY ?? (e.touches && e.touches[0].clientY)) - r.top;
+  return {x,y};
+}
+function begin(e){
+  e.preventDefault();
+  const p = pointerPos(e);
+  if(!started){
+    started = true;
+    t0 = performance.now();
+    startPt = p;
+    lastAngle = Math.atan2(p.y - cy, p.x - cx);
+  }
+  drawing = true;
+  ctx.strokeStyle = '#111'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(p.x, p.y);
+  points = [{x:p.x, y:p.y, t:performance.now()}];
+}
+function move(e){
+  if(!drawing || finished) return;
+  e.preventDefault();
+  const p = pointerPos(e);
+  ctx.lineTo(p.x, p.y); ctx.stroke();
+  points.push({x:p.x, y:p.y, t:performance.now()});
+
+  // 누적 회전각(unwrapped)
+  const ang = Math.atan2(p.y - cy, p.x - cx);
+  let d = ang - lastAngle;
+  while (d <= -Math.PI) d += Math.PI*2;
+  while (d >  Math.PI) d -= Math.PI*2;
+  cumulativeAngle += d;
+  lastAngle = ang;
+
+  // 완성 조건: 완화된 임계값 적용
+  const revol = Math.abs(cumulativeAngle) / (Math.PI*2);
+  const dist  = Math.hypot(p.x - startPt.x, p.y - startPt.y);
+  const nearStart = dist <= Math.max(COMPLETE_DIST_MIN_PX, TARGET_R * COMPLETE_DIST_SCALE);
+  if (revol >= COMPLETE_REV_THRESH && nearStart) finish();
+}
+function end(){ drawing = false; }
+
+function finish(){
+  if (finished) return;
+  finished = true;
+  const elapsed = (performance.now() - t0) / 1000;
+  fetch('/submit',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      points, center:{x:cx,y:cy},
+      duration_s:elapsed, client_w:window.innerWidth, client_h:window.innerHeight
+    })
+  }).then(r=>r.json()).then(res=>{
+    scoreSpan.textContent    = res.score;
+    durationSpan.textContent = res.duration_s.toFixed(2);
+  }).catch(()=>{
+    durationSpan.textContent = elapsed.toFixed(2);
+  });
+}
+
+canvas.addEventListener('pointerdown', begin);
+canvas.addEventListener('pointermove', move);
+canvas.addEventListener('pointerup',   end);
+canvas.addEventListener('pointerleave',end);
+
+canvas.addEventListener('touchstart', e=>begin(e), {passive:false});
+canvas.addEventListener('touchmove',  e=>move(e),  {passive:false});
+canvas.addEventListener('touchend',   e=>end(e),   {passive:false});
+
+resetBtn.addEventListener('click', resetAll);
+window.addEventListener('resize', layout);
+window.addEventListener('orientationchange', layout);
+
+layout();
+resetAll();
+</script>
+</body>
+</html>
